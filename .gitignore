@@ -1,0 +1,8 @@
+results/
+*.jsonl
+*.csv
+*.log
+.env
+__mycache__/
+*.pyc
+.pytest_cache/
