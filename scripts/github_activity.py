@@ -322,6 +322,7 @@ def main():
     """Fetch, normalize, sort, and export the activity of all accessible repos."""
     # getpass hides the input and keeps the token out of command history and process logs
     #TODO: implement Azure Key Vault token pass
+    #TODO: implement a log extraction relative to a script time execution
     token = getpass("GitHub token: ").strip()
     session = make_session(token)
 
