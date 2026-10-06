@@ -1,10 +1,8 @@
 """GitHub activity extractor.
-
 Collects commits, pull requests, and issues from all repositories the
 token can access, normalizes them into one common record format, and
 writes a chronological timeline as JSON Lines and CSV.
 """
-
 import csv
 import json
 import logging
@@ -60,7 +58,6 @@ def backoff_sleep(attempt):
 
 def rate_limit_wait(r):
     """Return seconds to wait if the response is a rate limit, otherwise None.
-
     GitHub signals rate limits with 403 or 429, plus either a Retry-After
     header or X-RateLimit-Remaining: 0 with a reset timestamp.
     """

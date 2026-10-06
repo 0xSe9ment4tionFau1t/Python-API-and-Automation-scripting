@@ -1,7 +1,5 @@
 # Python-API-and-Automation-scripting
 
-Currently, learning Python, specifically API interaction and error handling.
+The repo contains tools and scripts which I made to automate daily routine tasks, from time to time i'll add more scripts  
 
-[APIs] httpbin.org, JSONPlaceholder, PokeAPI
-
-[Objective] Initially learn basic interactions with an API, final objective make a script to handle github log pipelining. Result will be uploaded in this repo, likely close to 04.10 
+1) scripts/github_activity.py - a Python script that extracts GitHub repository activity (commits, pull requests, and issues), normalizes it into a unified timeline, and exports it as JSON Lines and CSV. Handles retries and rate-limiting. Status: work in progress. Next steps are further testing and onboarding the output into a SIEM. Built as a learning project to solve a real task, wrote the code myself, with Claude as a tutor and code reviewer.  
