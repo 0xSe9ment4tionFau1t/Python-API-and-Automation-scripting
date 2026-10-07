@@ -10,6 +10,7 @@ import sys
 import time
 from getpass import getpass
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -22,10 +23,15 @@ CSV_PATH = BASE_DIR / "github_activity.csv"
 LOG_PATH = BASE_DIR / "github_activity.log"
 
 API_URL = "https://api.github.com"  # Base URL of the GitHub REST API
+API_HOST = urlparse(API_URL).netloc  # "api.github.com": the only host that may receive the token
 MAX_PAGES = 50      # Safety limit: max pages fetched per endpoint
 MAX_RETRIES = 3     # Max attempts per request before giving up
 BACKOFF = 2         # Initial retry delay in seconds; doubles each attempt (2s, 4s, ...)
 MAX_WAIT = 300      # Longest rate-limit wait accepted, in seconds
+DEFAULT_WAIT = 60   # Wait used when a rate-limit header can't be parsed
+
+# Excel treats cells starting with these characters as formulas
+FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 # Activity sources to collect per repository, with their query parameters.
 # Keys are GitHub endpoint names and must match the keys in NORMALIZERS.
@@ -50,6 +56,16 @@ log = logging.getLogger(__name__)
 
 # ---------- HTTP helpers ----------
 
+def is_trusted_url(url):
+    """Return True only for HTTPS URLs on the GitHub API host.
+
+    The session sends the token with every request, so any URL taken from a
+    response (like a next-page link) must be checked before following it.
+    """
+    parsed = urlparse(url)
+    return parsed.scheme == "https" and parsed.netloc == API_HOST
+
+
 def backoff_sleep(attempt):
     """Wait before the next attempt, but not after the last one."""
     if attempt < MAX_RETRIES:
@@ -65,10 +81,18 @@ def rate_limit_wait(r):
         return None
     # Secondary rate limit: GitHub tells us directly how long to wait
     if "Retry-After" in r.headers:
-        return int(r.headers["Retry-After"])
+        try:
+            return max(int(r.headers["Retry-After"]), 0)
+        except ValueError:
+            log.warning(f"unparseable Retry-After header, waiting {DEFAULT_WAIT}s")
+            return DEFAULT_WAIT
     # Primary rate limit: wait until the reset time (Unix timestamp), +1s margin
     if r.headers.get("X-RateLimit-Remaining") == "0":
-        reset = int(r.headers["X-RateLimit-Reset"])
+        try:
+            reset = int(r.headers["X-RateLimit-Reset"])
+        except (KeyError, ValueError):
+            log.warning(f"unparseable X-RateLimit-Reset header, waiting {DEFAULT_WAIT}s")
+            return DEFAULT_WAIT
         return max(reset - time.time(), 0) + 1
     return None  # A 403 that isn't a rate limit, e.g. missing permissions
 
@@ -87,10 +111,15 @@ def fetch(session, label, url, **kwargs):
         # Network-level failures: no response at all, so retry
         try:
             r = session.get(url, **kwargs)
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError) as e:
             log.warning(f"{label}: attempt {attempt}/{MAX_RETRIES} failed: {e}")
             backoff_sleep(attempt)
             continue
+        except requests.exceptions.RequestException as e:
+            # Log only the type: some messages contain header values, including the token
+            log.error(f"{label}: request failed: {type(e).__name__}")
+            return None
 
         # Rate limited: wait as long as GitHub asks, unless that's too long
         wait = rate_limit_wait(r)
@@ -160,6 +189,10 @@ def fetch_all(session, label, url, params=None):
         # GitHub puts the next page URL in the Link header, requests parses it into resp.links
         next_link = resp.links.get("next")
         url = next_link["url"] if next_link else None  # None on the last page ends the loop
+        if url is not None and not is_trusted_url(url):
+            # Log only the host: the rest of an attacker-supplied URL could contain anything
+            log.error(f"{label}: refusing to follow next link to untrusted URL (host: {urlparse(url).netloc})")
+            return None
         params = None  # The next URL already contains the query parameters
     return items
 
@@ -177,14 +210,14 @@ class MalformedRecord(ValueError):
     """Raised when an API item lacks data that GitHub documents as never null."""
 
 
-def require(item, field, label):
-    """Return item[field], or raise MalformedRecord if it is None.
-
-    A missing key still raises KeyError, which collect_records also handles.
-    """
+def require(item, field, label, expected_type=None):
+    """Return item[field], or raise MalformedRecord if it is None or of the wrong type."""
     value = item[field]
     if value is None:
         raise MalformedRecord(f"{label}: required field '{field}' is null")
+    if expected_type is not None and not isinstance(value, expected_type):
+        raise MalformedRecord(f"{label}: field '{field}' should be {expected_type.__name__}, "
+                              f"got {type(value).__name__}")
     return value
 
 
@@ -202,6 +235,8 @@ def normalize_commit(repo, commit):
     if timestamp is None:
         # Without a timestamp the record can't be placed on the timeline (and would break the sort)
         raise MalformedRecord(f"{label}: no author or committer date")
+    if not isinstance(timestamp, str):
+        raise MalformedRecord(f"{label}: date should be text, got {type(timestamp).__name__}")
 
     # Summary: first non-blank line of the message, or "" if there is none
     message = require(git, "message", label)
@@ -225,7 +260,7 @@ def normalize_pull(repo, pr):
     label = f"pull #{number}"
 
     return {
-        "timestamp": require(pr, "created_at", label),  # Creation time, not merge time
+        "timestamp": require(pr, "created_at", label, str),  # Creation time, not merge time
         "repo": repo,
         "type": "pull",
         "actor": (pr["user"] or {}).get("login", "unknown"),  # user is nullable
@@ -241,7 +276,7 @@ def normalize_issue(repo, issue):
     label = f"issue #{number}"
 
     return {
-        "timestamp": require(issue, "created_at", label),
+        "timestamp": require(issue, "created_at", label, str),
         "repo": repo,
         "type": "issue",
         "actor": (issue["user"] or {}).get("login", "unknown"),  # user is nullable
@@ -289,14 +324,24 @@ def collect_records(session, repos):
             log.info(f"{kind} {name}: {len(items)} items fetched")
             normalize = NORMALIZERS[kind]  # Pick the matching normalizer function
             for item in items:
+                if not isinstance(item, dict):
+                    log.warning(f"{kind} {name}: skipping item that is not an object: {type(item).__name__}")
+                    continue
                 if kind == "issues" and "pull_request" in item:
                     continue  # Skip pull requests hiding in the issues list
                 try:
                     records.append(normalize(name, item))
-                except (MalformedRecord, KeyError) as e:
+                except (MalformedRecord, KeyError, TypeError, AttributeError) as e:
                     # One broken item must not stop the run, but it must not vanish silently either
-                    log.warning(f"{kind} {name}: skipping malformed item: {e!r}")
+                    log.warning(f"{kind} {name}: skipping malformed item: {e!r}")                                
     return records
+
+
+def excel_safe(value):
+    """Prefix formula-like strings with ' so Excel shows them as text (CSV injection)."""
+    if isinstance(value, str) and value.startswith(FORMULA_PREFIXES):
+        return "'" + value
+    return value
 
 
 def write_outputs(records):
@@ -313,9 +358,10 @@ def write_outputs(records):
     # utf-8-sig adds a marker so Excel displays non-ASCII characters correctly.
     fieldnames = list(records[0].keys())
     with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
         writer.writeheader()
-        writer.writerows(records)
+        # Neutralize formulas only here: the JSONL above keeps the raw evidence
+        writer.writerows({key: excel_safe(value) for key, value in r.items()} for r in records)
 
 
 def main():
