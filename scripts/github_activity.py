@@ -6,6 +6,7 @@ writes a chronological timeline as JSON Lines and CSV.
 import csv
 import json
 import logging
+import os
 import sys
 import time
 from getpass import getpass
@@ -30,6 +31,9 @@ BACKOFF = 2         # Initial retry delay in seconds; doubles each attempt (2s, 
 MAX_WAIT = 300      # Longest rate-limit wait accepted, in seconds
 DEFAULT_WAIT = 60   # Wait used when a rate-limit header can't be parsed
 
+VAULT_URL_ENV = "GH_ACTIVITY_VAULT_URL"
+SECRET_NAME = "github-token"
+
 # Excel treats cells starting with these characters as formulas
 FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
@@ -52,6 +56,33 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+logging.getLogger("azure").setLevel(logging.WARNING)
+
+# ---------- Azure auth ---------- 
+
+def fetch_secret_from_vault(vault_url, name):
+    """Read one secret from Azure Key Vault using DefaultAzureCredential."""
+    from azure.identity import DefaultAzureCredential
+    from azure.keyvault.secrets import SecretClient
+
+    client = SecretClient(vault_url=vault_url, credential=DefaultAzureCredential())
+    return client.get_secret(name).value
+
+
+def get_token():
+    vault_url = os.environ.get(VAULT_URL_ENV)
+    if not vault_url:
+        return getpass("GitHub token: ").strip()
+    try:
+        secret = fetch_secret_from_vault(vault_url, SECRET_NAME)
+    except Exception as e:
+        log.error("Could not read token from Key Vault: %s", type(e).__name__)
+        return None
+    token = (secret or "").strip()
+    if not token:
+        log.error("Key Vault returned an empty token")
+        return None
+    return token
 
 
 # ---------- HTTP helpers ----------
@@ -366,10 +397,11 @@ def write_outputs(records):
 
 def main():
     """Fetch, normalize, sort, and export the activity of all accessible repos."""
-    # getpass hides the input and keeps the token out of command history and process logs
-    #TODO: implement Azure Key Vault token pass
     #TODO: implement a log extraction relative to a script time execution
-    token = getpass("GitHub token: ").strip()
+    # Token comes from Key Vault, or from a hidden prompt if no vault is configured
+    token = get_token()
+    if token is None:
+        sys.exit(1)
     session = make_session(token)
 
     repos = fetch_all(session, "repos", f"{API_URL}/user/repos", params={"per_page": 100})
